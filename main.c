@@ -2,22 +2,26 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <shlwapi.h>
 #include <winioctl.h>
 
-// Version 0.5 - Added drive wiping capability
+#pragma comment(lib, "shlwapi.lib")
+
+// Version 0.7 - Added log copying functionality
 
 void printMenu();
 void wipeDrives();
 void moveSMSTSLogs();
 void findUSBDrives(char drives[][4], int *count);
 BOOL wipePhysicalDrive(int driveNumber);
+BOOL copyFileToUSB(const char *source, const char *destination);
 
 int main()
 {
     int choice;
 
     printf("=== WinPE System Utility ===\n");
-    printf("Version 0.5 - Development Build\n\n");
+    printf("Version 0.7 - Beta Build\n\n");
 
     while (1)
     {
@@ -61,13 +65,13 @@ void wipeDrives()
 {
     char response;
     printf("=== DRIVE WIPE UTILITY ===\n");
-    printf("WARNING: This will erase all data!\n");
+    printf("WARNING: This will PERMANENTLY erase all data!\n");
     printf("Continue? (y/N): ");
     scanf(" %c", &response);
 
     if (response != 'y' && response != 'Y')
     {
-        printf("Cancelled.\n");
+        printf("Operation cancelled.\n");
         return;
     }
 
@@ -103,28 +107,32 @@ void wipeDrives()
     }
 
     int driveNum;
-    printf("\nEnter drive number (-1 to cancel): ");
+    printf("\nEnter drive number to wipe (or -1 to cancel): ");
     scanf("%d", &driveNum);
 
     if (driveNum == -1)
     {
-        printf("Cancelled.\n");
+        printf("Operation cancelled.\n");
         return;
     }
 
-    printf("\nFinal confirmation for Drive %d? (y/N): ", driveNum);
+    printf("\nFinal confirmation: Wipe PhysicalDrive%d? (y/N): ", driveNum);
     scanf(" %c", &response);
 
     if (response == 'y' || response == 'Y')
     {
         if (wipePhysicalDrive(driveNum))
         {
-            printf("Drive wiped successfully.\n");
+            printf("Drive %d wiped successfully.\n", driveNum);
         }
         else
         {
-            printf("Wipe failed.\n");
+            printf("Failed to wipe drive %d.\n", driveNum);
         }
+    }
+    else
+    {
+        printf("Operation cancelled.\n");
     }
 }
 
@@ -139,7 +147,7 @@ BOOL wipePhysicalDrive(int driveNumber)
 
     if (hDrive == INVALID_HANDLE_VALUE)
     {
-        printf("Cannot open drive. Error: %lu\n", GetLastError());
+        printf("Error: Cannot open drive %d. Error code: %lu\n", driveNumber, GetLastError());
         return FALSE;
     }
 
@@ -150,6 +158,7 @@ BOOL wipePhysicalDrive(int driveNumber)
                          NULL, 0, &diskGeometry, sizeof(diskGeometry),
                          &bytesReturned, NULL))
     {
+        printf("Error: Cannot get drive geometry. Error code: %lu\n", GetLastError());
         CloseHandle(hDrive);
         return FALSE;
     }
@@ -158,16 +167,17 @@ BOOL wipePhysicalDrive(int driveNumber)
                              diskGeometry.TracksPerCylinder *
                              diskGeometry.SectorsPerTrack;
 
-    const DWORD bufferSize = 1024 * 1024; // 1MB buffer
+    const DWORD bufferSize = 1024 * 1024;
     BYTE *buffer = (BYTE *)calloc(bufferSize, 1);
 
     if (!buffer)
     {
+        printf("Error: Cannot allocate memory for wiping.\n");
         CloseHandle(hDrive);
         return FALSE;
     }
 
-    printf("Wiping...\n");
+    printf("Wiping drive... This may take a while.\n");
 
     ULONGLONG bytesWritten = 0;
     ULONGLONG totalBytes = totalSectors * diskGeometry.BytesPerSector;
@@ -179,6 +189,7 @@ BOOL wipePhysicalDrive(int driveNumber)
 
         if (!WriteFile(hDrive, buffer, toWrite, &written, NULL))
         {
+            printf("Error writing to drive. Error code: %lu\n", GetLastError());
             break;
         }
 
@@ -206,7 +217,7 @@ void moveSMSTSLogs()
 
     if (usbCount == 0)
     {
-        printf("No USB drives found.\n");
+        printf("No USB drives found. Please insert a USB drive.\n");
         return;
     }
 
@@ -216,7 +227,90 @@ void moveSMSTSLogs()
         printf("%d. %s\n", i + 1, usbDrives[i]);
     }
 
-    printf("\nLog copying feature coming soon.\n");
+    int choice;
+    printf("Select USB drive (1-%d): ", usbCount);
+    scanf("%d", &choice);
+
+    if (choice < 1 || choice > usbCount)
+    {
+        printf("Invalid selection.\n");
+        return;
+    }
+
+    char *targetDrive = usbDrives[choice - 1];
+
+    // Common SMSTS log locations
+    const char *logPaths[] = {
+        "C:\\Windows\\CCM\\Logs\\smsts.log",
+        "C:\\_SMSTaskSequence\\Logs\\smsts.log",
+        "X:\\Windows\\Temp\\SMSTSLog\\smsts.log",
+        "C:\\SMSTSLog\\smsts.log"};
+
+    char destPath[MAX_PATH];
+    sprintf(destPath, "%s\\SMSTSLogs", targetDrive);
+    CreateDirectory(destPath, NULL);
+
+    printf("Searching for SMSTS logs...\n");
+    int foundLogs = 0;
+
+    for (int i = 0; i < sizeof(logPaths) / sizeof(logPaths[0]); i++)
+    {
+        if (PathFileExists(logPaths[i]))
+        {
+            char fileName[MAX_PATH];
+            char destFile[MAX_PATH];
+
+            strcpy(fileName, PathFindFileName(logPaths[i]));
+            sprintf(destFile, "%s\\%s", destPath, fileName);
+
+            if (copyFileToUSB(logPaths[i], destFile))
+            {
+                printf("Copied: %s\n", logPaths[i]);
+                foundLogs++;
+            }
+            else
+            {
+                printf("Failed to copy: %s\n", logPaths[i]);
+            }
+        }
+    }
+
+    // Search for additional log files
+    WIN32_FIND_DATA findData;
+    HANDLE hFind;
+
+    const char *logDirs[] = {
+        "C:\\Windows\\CCM\\Logs\\",
+        "C:\\_SMSTaskSequence\\Logs\\",
+        "X:\\Windows\\Temp\\SMSTSLog\\",
+        "C:\\SMSTSLog\\"};
+
+    for (int i = 0; i < sizeof(logDirs) / sizeof(logDirs[0]); i++)
+    {
+        char searchPattern[MAX_PATH];
+        sprintf(searchPattern, "%s*.log", logDirs[i]);
+
+        hFind = FindFirstFile(searchPattern, &findData);
+        if (hFind != INVALID_HANDLE_VALUE)
+        {
+            do
+            {
+                char sourcePath[MAX_PATH];
+                char destFile[MAX_PATH];
+                sprintf(sourcePath, "%s%s", logDirs[i], findData.cFileName);
+                sprintf(destFile, "%s\\%s", destPath, findData.cFileName);
+
+                if (copyFileToUSB(sourcePath, destFile))
+                {
+                    foundLogs++;
+                }
+            } while (FindNextFile(hFind, &findData));
+            FindClose(hFind);
+        }
+    }
+
+    printf("\nTotal logs copied: %d\n", foundLogs);
+    printf("Logs saved to: %s\n", destPath);
 }
 
 void findUSBDrives(char drives[][4], int *count)
@@ -239,4 +333,9 @@ void findUSBDrives(char drives[][4], int *count)
             }
         }
     }
+}
+
+BOOL copyFileToUSB(const char *source, const char *destination)
+{
+    return CopyFile(source, destination, FALSE);
 }
